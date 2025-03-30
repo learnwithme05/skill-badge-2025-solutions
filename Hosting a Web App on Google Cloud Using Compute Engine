@@ -1,6 +1,8 @@
 
-Part1:-
-gcloud config set compute/zone us-central1-f
+export ZONE=
+gcloud config set compute/zone $ZONE
+
+gcloud config set compute/region $REGION
 
 gcloud services enable compute.googleapis.com
 
@@ -14,16 +16,47 @@ cd ~/monolith-to-microservices
 
 nvm install --lts
 
+cd monolith-to-microservices/
 
-Part2:- 
+cat > startup-script.sh <<EOF_START
+#!/bin/bash
+# Install logging monitor. The monitor will automatically pick up logs sent to syslog.
+curl -s "https://storage.googleapis.com/signals-agents/logging/google-fluentd-install.sh" | bash
+service google-fluentd restart &
+# Install dependencies from apt
+apt-get update
+apt-get install -yq ca-certificates git build-essential supervisor psmisc
+# Install nodejs
+mkdir /opt/nodejs
+curl https://nodejs.org/dist/v16.14.0/node-v16.14.0-linux-x64.tar.gz | tar xvzf - -C /opt/nodejs --strip-components=1
+ln -s /opt/nodejs/bin/node /usr/bin/node
+ln -s /opt/nodejs/bin/npm /usr/bin/npm
+# Get the application source code from the Google Cloud Storage bucket.
+mkdir /fancy-store
+gsutil -m cp -r gs://fancy-store-$DEVSHELL_PROJECT_ID/monolith-to-microservices/microservices/* /fancy-store/
+# Install app dependencies.
+cd /fancy-store/
+npm install
+# Create a nodeapp user. The application will run as this user.
+useradd -m -d /home/nodeapp nodeapp
+chown -R nodeapp:nodeapp /opt/app
+# Configure supervisor to run the node app.
+cat >/etc/supervisor/conf.d/node-app.conf <<EOF_END
+[program:nodeapp]
+directory=/fancy-store
+command=npm start
+autostart=true
+autorestart=true
+user=nodeapp
+environment=HOME="/home/nodeapp",USER="nodeapp",NODE_ENV="production"
+stdout_logfile=syslog
+stderr_logfile=syslog
+EOF_END
+supervisorctl reread
+supervisorctl update
+EOF_START
 
-Open Editor 
-
-Click on File > New File and create a file called startup-script.sh
-
-
-
-Part3:- 
+cd ~
 
 gsutil cp ~/monolith-to-microservices/startup-script.sh gs://fancy-store-$DEVSHELL_PROJECT_ID
 
@@ -31,26 +64,24 @@ cd ~
 rm -rf monolith-to-microservices/*/node_modules
 gsutil -m cp -r monolith-to-microservices gs://fancy-store-$DEVSHELL_PROJECT_ID/
 
-
 gcloud compute instances create backend \
-    --machine-type=n1-standard-1 \
+    --zone=$ZONE \
+    --machine-type=e2-standard-2 \
     --tags=backend \
    --metadata=startup-script-url=https://storage.googleapis.com/fancy-store-$DEVSHELL_PROJECT_ID/startup-script.sh
 
 gcloud compute instances list
 
+export EXTERNAL_IP_BACKEND=$(gcloud compute instances describe backend --zone=$ZONE --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
 
+cd monolith-to-microservices/react-app
 
+cat > .env <<EOF
+REACT_APP_ORDERS_URL=http://$EXTERNAL_IP_BACKEND:8081/api/orders
+REACT_APP_PRODUCTS_URL=http://$EXTERNAL_IP_BACKEND:8082/api/products
+EOF
 
-Part4:-
-
-In the Cloud Shell Explorer, navigate to monolith-to-microservices > react-app.
-
-In the Code Editor, select View > Toggle Hidden Files in order to see the .env file.
-
-
-
-Part5:-
+cd ~
 
 cd ~/monolith-to-microservices/react-app
 npm install && npm run-script build
@@ -61,10 +92,10 @@ rm -rf monolith-to-microservices/*/node_modules
 gsutil -m cp -r monolith-to-microservices gs://fancy-store-$DEVSHELL_PROJECT_ID/
 
 gcloud compute instances create frontend \
-    --machine-type=n1-standard-1 \
+    --zone=$ZONE \
+    --machine-type=e2-standard-2 \
     --tags=frontend \
     --metadata=startup-script-url=https://storage.googleapis.com/fancy-store-$DEVSHELL_PROJECT_ID/startup-script.sh
-
 
 gcloud compute firewall-rules create fw-fe \
     --allow tcp:8080 \
@@ -76,34 +107,40 @@ gcloud compute firewall-rules create fw-be \
 
 gcloud compute instances list
 
-gcloud compute instances stop frontend
+gcloud compute instances stop frontend --zone=$ZONE
 
-gcloud compute instances stop backend
+gcloud compute instances stop backend --zone=$ZONE
 
 gcloud compute instance-templates create fancy-fe \
+    --source-instance-zone=$ZONE \
     --source-instance=frontend
 
 gcloud compute instance-templates create fancy-be \
+    --source-instance-zone=$ZONE \
     --source-instance=backend
 
 gcloud compute instance-templates list
 
-gcloud compute instances delete --quiet  backend
+gcloud compute instances delete --quiet backend --zone=$ZONE
 
 gcloud compute instance-groups managed create fancy-fe-mig \
+    --zone=$ZONE \
     --base-instance-name fancy-fe \
     --size 2 \
     --template fancy-fe
 
 gcloud compute instance-groups managed create fancy-be-mig \
+    --zone=$ZONE \
     --base-instance-name fancy-be \
     --size 2 \
     --template fancy-be
 
 gcloud compute instance-groups set-named-ports fancy-fe-mig \
+    --zone=$ZONE \
     --named-ports frontend:8080
 
 gcloud compute instance-groups set-named-ports fancy-be-mig \
+    --zone=$ZONE \
     --named-ports orders:8081,products:8082
 
 gcloud compute health-checks create http fancy-fe-hc \
@@ -127,10 +164,12 @@ gcloud compute firewall-rules create allow-health-check \
     --network default
 
 gcloud compute instance-groups managed update fancy-fe-mig \
+    --zone=$ZONE \
     --health-check fancy-fe-hc \
     --initial-delay 300
 
 gcloud compute instance-groups managed update fancy-be-mig \
+    --zone=$ZONE \
     --health-check fancy-be-hc \
     --initial-delay 300
 
@@ -162,18 +201,18 @@ gcloud compute backend-services create fancy-be-products \
   --global
 
 gcloud compute backend-services add-backend fancy-fe-frontend \
+  --instance-group-zone=$ZONE \
   --instance-group fancy-fe-mig \
-  --instance-group-zone us-central1-f \
   --global
 
 gcloud compute backend-services add-backend fancy-be-orders \
+  --instance-group-zone=$ZONE \
   --instance-group fancy-be-mig \
-  --instance-group-zone us-central1-f \
   --global
 
 gcloud compute backend-services add-backend fancy-be-products \
+  --instance-group-zone=$ZONE \
   --instance-group fancy-be-mig \
-  --instance-group-zone us-central1-f \
   --global
 
 gcloud compute url-maps create fancy-map \
@@ -193,25 +232,35 @@ gcloud compute forwarding-rules create fancy-http-rule \
   --target-http-proxy fancy-proxy \
   --ports 80
 
+
+
+
+
+
+
+------------------------------------------------------------------------
+
+
+
+gcloud config set compute/zone $ZONE
+
+gcloud config set compute/region $REGION
+
 cd ~/monolith-to-microservices/react-app/
 
 gcloud compute forwarding-rules list --global
 
+export EXTERNAL_IP_FANCY=$(gcloud compute forwarding-rules describe fancy-http-rule --global --format='get(IPAddress)')
 
+cat > .env <<EOF
+REACT_APP_ORDERS_URL=http://$EXTERNAL_IP_BACKEND:8081/api/orders
+REACT_APP_PRODUCTS_URL=http://$EXTERNAL_IP_BACKEND:8082/api/products
 
+REACT_APP_ORDERS_URL=http://$EXTERNAL_IP_FANCY/api/orders
+REACT_APP_PRODUCTS_URL=http://$EXTERNAL_IP_FANCY/api/products
+EOF
 
-Part6:-
-
-
-Return to the Cloud Shell Editor
-
-
-REACT_APP_ORDERS_URL=http://[LB_IP]/api/orders
-
-REACT_APP_PRODUCTS_URL=http://[LB_IP]/api/products
-
-
-Part7:-
+cd ~
 
 cd ~/monolith-to-microservices/react-app
 npm install && npm run-script build
@@ -220,52 +269,50 @@ cd ~
 rm -rf monolith-to-microservices/*/node_modules
 gsutil -m cp -r monolith-to-microservices gs://fancy-store-$DEVSHELL_PROJECT_ID/
 
-
 gcloud compute instance-groups managed rolling-action replace fancy-fe-mig \
+    --zone=$ZONE \
     --max-unavailable 100%
-
 
 gcloud compute instance-groups managed set-autoscaling \
   fancy-fe-mig \
+  --zone=$ZONE \
   --max-num-replicas 2 \
   --target-load-balancing-utilization 0.60
-
 
 gcloud compute instance-groups managed set-autoscaling \
   fancy-be-mig \
+  --zone=$ZONE \
   --max-num-replicas 2 \
   --target-load-balancing-utilization 0.60
-
 
 gcloud compute backend-services update fancy-fe-frontend \
     --enable-cdn --global
 
-
-gcloud compute instances set-machine-type frontend --machine-type custom-4-3840
+gcloud compute instances set-machine-type frontend \
+  --zone=$ZONE \
+  --machine-type e2-small
 
 gcloud compute instance-templates create fancy-fe-new \
+    --region=$REGION \
     --source-instance=frontend \
-    --source-instance-zone=us-central1-f
+    --source-instance-zone=$ZONE
 
 gcloud compute instance-groups managed rolling-action start-update fancy-fe-mig \
-    --version template=fancy-fe-new
-
+  --zone=$ZONE \
+  --version template=fancy-fe-new
 
 cd ~/monolith-to-microservices/react-app/src/pages/Home
 mv index.js.new index.js
 
-
 cat ~/monolith-to-microservices/react-app/src/pages/Home/index.js
-
 
 cd ~/monolith-to-microservices/react-app
 npm install && npm run-script build
-
 
 cd ~
 rm -rf monolith-to-microservices/*/node_modules
 gsutil -m cp -r monolith-to-microservices gs://fancy-store-$DEVSHELL_PROJECT_ID/
 
-
 gcloud compute instance-groups managed rolling-action replace fancy-fe-mig \
-    --max-unavailable=100%
+  --zone=$ZONE \
+  --max-unavailable=100%
